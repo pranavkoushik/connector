@@ -261,17 +261,22 @@ with st.expander("Preview first filtered row (raw JSON)"):
 # load OpenAI key from secrets or env
 OPENAI_API_KEY = None
 OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_BASE_URL = "https://llm-gateway.prod.joveo.com/"
+
 try:
     OPENAI_API_KEY = st.secrets["openai"]["api_key"]
     OPENAI_MODEL = st.secrets["openai"].get("model", "gpt-4o-mini")
+    OPENAI_BASE_URL = st.secrets["openai"].get("base_url", "https://llm-gateway.prod.joveo.com/")
 except Exception:
-    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "sk-K3pdIROG5kzZ2-S_BtPXAg")
     OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://llm-gateway.prod.joveo.com/")
 
 if OPENAI_API_KEY is None:
     ai_enabled = False
 else:
     openai.api_key = OPENAI_API_KEY
+    openai.api_base = OPENAI_BASE_URL
     ai_enabled = True
 
 st.markdown("---")
