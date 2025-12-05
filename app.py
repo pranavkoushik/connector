@@ -6,6 +6,9 @@ from google.oauth2.service_account import Credentials
 from io import BytesIO
 from datetime import datetime
 import os
+import time
+import openai
+from math import ceil
 
 st.set_page_config(page_title="Leads — Master Viewer", layout="wide")
 
@@ -252,3 +255,238 @@ with st.expander("Preview first filtered row (raw JSON)"):
         st.json(filtered.iloc[0].to_dict())
     else:
         st.write("No rows to preview.")
+
+# --- START: AI Query / Sheet Control Panel ---
+
+# load OpenAI key from secrets or env
+OPENAI_API_KEY = None
+OPENAI_MODEL = "gpt-4o-mini"
+try:
+    OPENAI_API_KEY = st.secrets["openai"]["api_key"]
+    OPENAI_MODEL = st.secrets["openai"].get("model", "gpt-4o-mini")
+except Exception:
+    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+    OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+if OPENAI_API_KEY is None:
+    ai_enabled = False
+else:
+    openai.api_key = OPENAI_API_KEY
+    ai_enabled = True
+
+st.markdown("---")
+st.header("🤖 AI Query → Sheet Updater")
+
+st.markdown(
+    """
+Use this panel to run an LLM prompt against each lead and write the result back into a new column in your **Master** sheet.
+
+**Template placeholders:** use `{{First Name}}`, `{{Last Name}}`, `{{Email}}`, `{{Phone Number}}`, `{{Lead ID}}`, `{{Full Data JSON}}`, or any column name in double braces.
+"""
+)
+
+with st.form("ai_query_form"):
+    form_col1, form_col2 = st.columns([3,1])
+    with form_col1:
+        new_col_name = st.text_input("New column name to create (Sheet)", value="ai_result")
+        prompt_template = st.text_area(
+            "AI prompt (you can use placeholders like {{Email}} or {{Full Data JSON}})",
+            value=(
+                "You are a recruiter assistant. Based on the candidate data below, give a one-line "
+                "recommendation (Qualified / Maybe / Not Qualified) and a 10-word reason.\n\n"
+                "Candidate data:\n{{Full Data JSON}}\n\nOutput format: <Recommendation> — <short reason>"
+            ),
+            height=160,
+        )
+        apply_filtered_only = st.checkbox("Run only on currently filtered rows (recommended)", value=True)
+        batch_size = st.number_input("Batch size (requests per batch)", min_value=1, max_value=200, value=20)
+    with form_col2:
+        st.write("AI status:")
+        if not ai_enabled:
+            st.error("No OpenAI API key configured. Set `st.secrets['openai']['api_key']` or OPENAI_API_KEY env.")
+        else:
+            st.success(f"Ready — model: {OPENAI_MODEL}")
+        run_button = st.form_submit_button("Run AI and update sheet")
+
+def substitute_placeholders(template: str, row: pd.Series):
+    """
+    Replace {{Field}} with the row value (stringified). Fall back to empty string.
+    """
+    out = template
+    # include full data JSON
+    try:
+        full_json = row.to_dict()
+    except Exception:
+        full_json = {}
+    out = out.replace("{{Full Data JSON}}", str(full_json))
+    # replace each column placeholder
+    for col in row.index:
+        placeholder = "{{" + col + "}}"
+        val = "" if pd.isna(row[col]) else str(row[col])
+        out = out.replace(placeholder, val)
+    # common aliases
+    out = out.replace("{{First Name}}", str(row.get("First Name", "")))
+    out = out.replace("{{Last Name}}", str(row.get("Last Name", "")))
+    out = out.replace("{{Email}}", str(row.get("Email", "")))
+    out = out.replace("{{Phone Number}}", str(row.get("Phone Number", "")))
+    out = out.replace("{{Lead ID}}", str(row.get("Lead ID", "")))
+    return out
+
+def ensure_sheet_column(sheet, col_name):
+    """
+    Ensure the worksheet has the header col_name; if not, append column header.
+    Returns the 1-based column index of the target column.
+    """
+    headers = sheet.row_values(1)
+    if not headers:
+        headers = []
+    if col_name in headers:
+        col_idx = headers.index(col_name) + 1
+    else:
+        # append header to first row
+        headers.append(col_name)
+        sheet.update("1:1", [headers])  # overwrite first row
+        col_idx = len(headers)
+    return col_idx
+
+def call_llm_for_text(prompt_text, model, max_retries=3):
+    """
+    Simple wrapper for OpenAI ChatCompletion - adapt if you use another provider.
+    """
+    for attempt in range(max_retries):
+        try:
+            resp = openai.ChatCompletion.create(
+                model=model,
+                messages=[{"role":"user","content":prompt_text}],
+                temperature=0.0,
+                max_tokens=150
+            )
+            # extract text
+            content = resp["choices"][0]["message"]["content"].strip()
+            return content
+        except Exception as e:
+            # exponential backoff
+            wait = 2 ** attempt
+            time.sleep(wait)
+            last_exc = e
+    raise last_exc
+
+def colnum_to_letter(n):
+    """Convert column number to Excel-style letter (1=A, 2=B, etc.)"""
+    string = ""
+    while n > 0:
+        n, remainder = divmod(n-1, 26)
+        string = chr(65 + remainder) + string
+    return string
+
+if run_button and ai_enabled:
+    # confirm
+    if new_col_name.strip() == "":
+        st.error("Please provide a column name.")
+    else:
+        # choose rows to process
+        target_df = filtered if apply_filtered_only else df
+        if target_df.empty:
+            st.warning("No rows selected to process.")
+        else:
+            st.info(f"Processing {len(target_df)} rows — batching {batch_size} per request...")
+
+            # get gsheet worksheet with write permissions
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ]
+            try:
+                creds_dict = st.secrets["gcp_service_account"]
+                credentials = Credentials.from_service_account_info(dict(creds_dict), scopes=scopes)
+            except (KeyError, FileNotFoundError):
+                credentials = Credentials.from_service_account_file("creds.json", scopes=scopes)
+            
+            client = gspread.authorize(credentials)
+            ss = client.open_by_key(SPREADSHEET_ID)
+            try:
+                ws = ss.worksheet(MASTER_SHEET_NAME)
+            except Exception as e:
+                st.error(f"Cannot open worksheet: {e}")
+                st.stop()
+
+            # ensure column exists and find index
+            target_col_idx = ensure_sheet_column(ws, new_col_name)
+
+            # prepare mapping row -> sheet row number
+            sheet_headers = ws.row_values(1)
+            lead_id_col_name = None
+            lead_idx_in_sheet = None
+            for candidate in ["Lead ID", "lead_id", "LeadID", "leadId"]:
+                if candidate in sheet_headers:
+                    lead_id_col_name = candidate
+                    lead_idx_in_sheet = sheet_headers.index(candidate)  # 0-based
+                    break
+
+            # build list of (sheet_row_number, prompt_for_row)
+            rows_to_update = []
+            sheet_all_values = ws.get_all_values()
+            # find mapping from lead_id to sheet row number (1-based)
+            lead_to_rownum = {}
+            if lead_id_col_name and lead_idx_in_sheet is not None:
+                for r_idx, row_vals in enumerate(sheet_all_values, start=1):
+                    if len(row_vals) > lead_idx_in_sheet:
+                        lead_to_rownum[row_vals[lead_idx_in_sheet]] = r_idx
+
+            for idx, r in target_df.reset_index(drop=True).iterrows():
+                # decide sheet row number
+                sheet_row_num = None
+                if lead_id_col_name and str(r.get("Lead ID", "")) in lead_to_rownum:
+                    sheet_row_num = lead_to_rownum[str(r.get("Lead ID", ""))]
+                else:
+                    # fallback: assume table order matches sheet and row 1 is headers
+                    sheet_row_num = idx + 2
+
+                prompt_text = substitute_placeholders(prompt_template, r)
+                rows_to_update.append((sheet_row_num, prompt_text))
+
+            # run in batches, call LLM for each row and write in batches back to sheet
+            total = len(rows_to_update)
+            progress = st.progress(0)
+            results = []
+            batch_updates = []
+            for i, (sheet_row, ptext) in enumerate(rows_to_update, start=1):
+                try:
+                    ai_out = call_llm_for_text(ptext, OPENAI_MODEL)
+                except Exception as e:
+                    ai_out = f"ERROR: {str(e)}"
+                results.append((sheet_row, ai_out))
+
+                # create batch update entry for gspread (A1 notation)
+                col_letter = colnum_to_letter(target_col_idx)
+                cell_addr = f"{col_letter}{sheet_row}"
+                batch_updates.append({'range': cell_addr, 'values': [[ai_out]]})
+
+                # write in chunks to avoid huge single updates
+                if len(batch_updates) >= batch_size or i == total:
+                    try:
+                        ws.batch_update(batch_updates)
+                    except Exception as e:
+                        st.warning(f"Partial write failed: {e}")
+                        # try single cell writes as fallback
+                        for bu in batch_updates:
+                            rng = bu['range']
+                            val = bu['values'][0][0]
+                            try:
+                                ws.update(rng, [[val]])
+                            except Exception:
+                                pass
+                    batch_updates = []
+
+                # polite pacing to avoid rate limits
+                time.sleep(0.2)
+                progress.progress(i/total)
+
+            st.success(f"Completed {total} rows. Column '{new_col_name}' updated in sheet.")
+            # clear cache and rerun so changes reflect
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.rerun()
+# --- END: AI Query / Sheet Control Panel ---
